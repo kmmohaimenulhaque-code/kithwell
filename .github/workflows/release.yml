@@ -1,0 +1,152 @@
+name: Kithwell Security Audit & Auto-Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kithwell-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  security-and-test:
+    name: Security Audit & Automated Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify frontend JavaScript syntax
+        run: |
+          node --check web/js/app.js
+          node --check web/sw.js
+
+      - name: Run static and dynamic security audit
+        run: python3 scripts/security_audit.py
+
+  build-and-release:
+    name: Build Signed Assets & Publish GitHub Release
+    needs: security-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build release archives, SHA-256 sums, and update manifest
+        id: package
+        run: |
+          python3 - << 'EOF'
+          import hashlib
+          import json
+          import os
+          import tarfile
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from server.security.auto_updater import APP_VERSION, sign_manifest
+
+          root = Path(".")
+          dist = root / "dist"
+          dist.mkdir(exist_ok=True)
+
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          tag = ref_name if ref_name.startswith("v") else f"v{APP_VERSION}"
+          version = tag.lstrip("v")
+
+          exclude_dirs = {".git", "dist", "data", "__pycache__"}
+          files = [
+              p for p in sorted(root.rglob("*"))
+              if p.is_file() and not (set(p.parts) & exclude_dirs)
+          ]
+
+          zip_path = dist / f"kithwell-{tag}-universal.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for p in files:
+                  zf.write(p, Path("kithwell") / p)
+
+          tar_path = dist / f"kithwell-{tag}-linux-macos.tar.gz"
+          with tarfile.open(tar_path, "w:gz") as tf:
+              for p in files:
+                  tf.add(p, arcname=str(Path("kithwell") / p))
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as fh:
+                  for chunk in iter(lambda: fh.read(65536), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          zip_sha = sha256_file(zip_path)
+          tar_sha = sha256_file(tar_path)
+
+          sums_path = dist / "SHA256SUMS.txt"
+          sums_path.write_text(
+              f"{zip_sha}  {zip_path.name}\n{tar_sha}  {tar_path.name}\n",
+              encoding="utf-8",
+          )
+
+          manifest = {
+              "version": version,
+              "channel": "stable",
+              "sha256": zip_sha,
+              "released_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "notes": f"Automated verified Kithwell {tag} release.",
+          }
+          manifest["signature"] = sign_manifest(manifest)
+          manifest_path = dist / "release-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as fh:
+                  fh.write(f"tag={tag}\n")
+                  fh.write(f"zip_asset={zip_path}\n")
+                  fh.write(f"tar_asset={tar_path}\n")
+                  fh.write(f"sums_asset={sums_path}\n")
+                  fh.write(f"manifest_asset={manifest_path}\n")
+          print(f"Prepared release assets for {tag}")
+          EOF
+
+      - name: Create or update GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "${{ steps.package.outputs.zip_asset }}" \
+              "${{ steps.package.outputs.tar_asset }}" \
+              "${{ steps.package.outputs.sums_asset }}" \
+              "${{ steps.package.outputs.manifest_asset }}" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "${{ steps.package.outputs.zip_asset }}" \
+              "${{ steps.package.outputs.tar_asset }}" \
+              "${{ steps.package.outputs.sums_asset }}" \
+              "${{ steps.package.outputs.manifest_asset }}" \
+              --title "Kithwell $TAG" \
+              --notes "Automated verified release of Kithwell Local-First Family Caregiving OS."
+          fi
